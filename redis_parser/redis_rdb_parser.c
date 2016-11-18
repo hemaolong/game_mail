@@ -65,8 +65,8 @@ static bool rdb_read_vint(FILE* f, int64_t* out){
 	return false;
 }
 
-static bool rdb_read_key(FILE* f, uint8_t flag, t_small_kv* out){
-  switch(flag){
+static bool rdb_read_key(FILE* f, uint8_t rdbtype, t_small_kv* out){
+  switch(rdbtype){
   	case 0: // String
   		break;
 
@@ -94,18 +94,15 @@ static void rdb_read_body(FILE* f){
 
 	uint8_t flag = 0;
     struct t_small_kv cur_value;
-    bool need_read_flag = true;
-	while(true){
-		if (need_read_flag){
-		    size_t ret = fread(&flag, sizeof(uint8_t), 1, f);
-		    if (ret < 1){
-		    	printf("ERROR, invalid field type\n");
-		    }
-		}
+    while (true) {
+        size_t ret = fread(&flag, sizeof(uint8_t), 1, f);
+        if (ret < 1) {
+            printf("ERROR, invalid field type\n");
+        }
 
-	    switch(flag){
-	    	case 0xFF:
-	    		printf("End to read db body\n");
+        switch (flag) {
+        case 0xFF:
+                printf("End to read db body\n");
 	    		return;
 	    	case 0xFE:
 	    	    uint8_t db_index = 0;
@@ -114,7 +111,7 @@ static void rdb_read_body(FILE* f){
 	    	    	return false;
 	    	    }
 	    		printf("Begin read db: %d\n", db_index);
-	    		need_read_flag = true;
+                continue;
 		    	break;
 
 		    case 0xFD:
@@ -123,7 +120,10 @@ static void rdb_read_body(FILE* f){
 	    	        printf("ERROR, invalid expire s\n");
 	    	    	return;
 	    	    }
-	    	    need_read_flag = true;
+                size_t ret = fread(&flag, sizeof(uint8_t), 1, f);
+                if (ret < 1) {
+                    printf("ERROR, invalid field type\n");
+                }
 			    break;
 		    case 0xFC:
 		    	uint8_t expiry[8];
@@ -131,10 +131,15 @@ static void rdb_read_body(FILE* f){
 	    	        printf("ERROR, invalid expire s\n");
 	    	    	return false;
 	    	    }
-	    	    need_read_flag = true;
+                size_t ret = fread(&flag, sizeof(uint8_t), 1, f);
+                if (ret < 1) {
+                    printf("ERROR, invalid field type\n");
+                }
 	    	    break;
-	    	 // String Hash, ;
-	    	 case 
+	    	 
+            default:
+                rdb_read_key(f, flag, cur_value);
+                break;
 	    }
 	}
 }
