@@ -1,5 +1,8 @@
 
 
+-- Game Common Poll System 
+-- @heml 2016.11.26
+
 local cjson = require 'cjson'
 local conf = require 'conf_server'
 local redis = require "resty.redis"
@@ -16,7 +19,7 @@ function game.poll(args)
 	end
 
 	-- Pub/sub redis
-	local red = redis:new()
+	local red = redis:new()	
   redis:set_timeout(1000*5)
 	local redis_conf = conf.redis.poll
 	local ok, err = red:connect(redis_conf.host, redis_conf.port)

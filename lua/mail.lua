@@ -1,3 +1,6 @@
+
+-- Game Mail System 
+-- @heml 2016.11.26
 local cjson = require 'cjson'
 local conf = require 'conf_server'
 local redis = require "resty.redis"
@@ -20,13 +23,6 @@ local function _get_mail_redis()
 end
 local function _get_player_key(player_id)
 	return 'player:' .. player_id
-end
-
-local function _get_player_mail_version_key()
-	return 'player_version'
-end
-
-local function _add_mail_to_player(mail_id, player_id, ts)
 end
 
 local function _get_server_broadcast_mail_id(server_id)
@@ -65,8 +61,8 @@ local function _fill_player_server_broadcast_mails(red, server_id, player_id, no
 		local mail_index = red:incr('mail_index')  
 	  local mail_id = 'mail:'..player_id..':'..mail_index
 	  red:restore(mail_id, _mail_expire_secs*1000, broadcast_body)
+	  red:hset(mail_id, 'boradcast_id', boradcast_id)
 	  red:zadd(player_key, now, mail_id)
-
 		ngx.log(ngx.INFO, 'send mail to player single|', player_id, ' ', server_id, ' ', mail_id, ' ', boradcast_id)
 		ngx.log(ngx.INFO, 'send mail to player broadcast|', player_id, ' ', server_id, ' ', mail_id, ' ', boradcast_id)
 	end
@@ -74,18 +70,20 @@ local function _fill_player_server_broadcast_mails(red, server_id, player_id, no
 	return true
 end
 
--- function mail.init(data)
--- 	local player_id, server_id = data.player_id, data.server_id
--- 	if player_id <= 0 or server_id <= 0 then
--- 		return {100, 'invalid player_id or server_id'}
--- 	end
+function mail.init_server(args)
+  local data = cjson.decode(args)
+	local server_id = data.server_id
+	if server_id <= 0 then
+		return {222, 'invalid server_id'}
+	end
 
--- 	local player_key = _get_player_key(player_id)
--- 	red:hset(player_key, 'server_id', server_id)
--- 	red:expire(player_key, 86400*35)
--- 	red:srem('serverplayer:'..server_id, player_id)
--- 	return 0, 'OK'
--- end
+	local pending_key = 'mail_pending:' .. server_id
+	local red = _get_mail_redis()
+	red:del(pending_key)
+	ngx.log(ngx.INFO, 'game server init ', server_id)
+
+	return 0
+end
 
 -- ENSURE the mail is self mail
 local function _array2map(a)
@@ -101,42 +99,69 @@ local function _resp_mail_list(red, player_id, mail_ids)
 	if not mail_ids then
 		return
 	end
-	local result = {player_id=player_id, mails={}}
+	local result = {}
 	for k, v in ipairs(mail_ids) do
 		local mail_attay = red:hgetall(v)
-		local mail = _array2map(mail_attay)
-		mail['mail_id'] = v
-		result.mails[#result.mails+1] = mail
+		if mail_attay and #mail_attay > 0 then
+			local mail = _array2map(mail_attay)
+			mail['mail_id'] = v
+			mail['player_id'] = player_id
+			result[#result+1] = mail
+		end
 	end
-	return 0, result
+	return 0, {mails=result}
+end
+local function _get_player_mails(red, now, player_id, server_id)
+	if not player_id or player_id <= 0 then return 300, 'invalid player_id' end
+	local player_key = _get_player_key(player_id)
+	-- Trim old mails
+	-- Reset the player data expire seconds
+	red:zremrangebyscore(player_key, '-inf', now - (_mail_expire_secs+_mail_expire_ultra_seconds))    -- Trim old mails
+	red:expire(player_key, _mail_expire_secs+_mail_expire_ultra_seconds)
+
+	-- Do send server-broadcast mails
+	if server_id then
+	  _fill_player_server_broadcast_mails(red, server_id, player_id, now)
+	end
+
+  local b = now - _mail_expire_secs
+	local ret, err = red:zrevrangebyscore(player_key, '+inf', b, 'limit', 0, _mail_count_max-1)
+	if not ret then
+		ngx.log(ngx.ERR, 'get player mail error ', err)
+	end
+	red:zremrangebyscore('mail_pending:'..server_id, player_id, player_id)
+	return _resp_mail_list(red, player_id, ret)
+end
+
+local function _get_pending_mails(red, now, server_id)
+  if not server_id then return 301, 'invalid server id' end
+
+  -- Only get the new mails
+	local peindingg_mails = red:zrange('mail_pending:'..server_id, 0, 99, 'withscores')
+	local mails = {}
+	for i = 1, #peindingg_mails/2 do
+		local mail_id = peindingg_mails[2*i-1]
+		local player_id = peindingg_mails[2*i]
+	end
+
+	red:zremrangebyscore('mail_pending:'..server_id, player_id, player_id)
+	return _resp_mail_list(red, player_id, peindingg_mails)
 end
 
 function mail.get(args)
   local data = cjson.decode(args)
 	local player_id, server_id, get_all = data.player_id, data.server_id, data.get_all
 	local now = ngx.time()
-	if not player_id or player_id <= 0 then return 300, 'invalid player_id' end
-
-	local player_key = _get_player_key(player_id)
-
 	local red = _get_mail_redis()
 	if get_all then
-		-- Do send server-broadcast mails
-		--_add_mail_to_player(_get_player_key(player_id), mail_id, now)
-		if server_id then
-		  _fill_player_server_broadcast_mails(red, server_id, player_id, now)
-		end
-
-    local b = now - _mail_expire_secs
-		local ret, err = red:zrevrangebyscore(player_key, '+inf', b, 'limit', 0, _mail_count_max-1)
-		if not ret then
-			ngx.log(ngx.ERR, 'get player mail error ', err)
-		end
-		return _resp_mail_list(red, player_id, ret)
+		return _get_player_mails(red, now, player_id, server_id)
 	end
+end
 
-	-- Only get the new mails
-	return _resp_mail_list(red, player_id, red:zrangebyscore('mail_pending:'..server_id, player_id, player_id))
+function mail.get_pendings(args)
+  local data = cjson.decode(args)
+	local server_id = data.player_id, data.server_id, data.get_all
+
 end
 
 function mail.delete(args)
@@ -160,8 +185,7 @@ local _read_script = [[
   if not ms then
    return {false, 'mail thief'.. mail_id}
   end
-  local exist = redis.call('exists', mail_id)
-  if not exist then
+  if redis.call('exists', mail_id) == 0 then
   	return {false, 'mail miss ' .. mail_id}
   end
   if redis.call('hsetnx', mail_id, 'read', 1) ~= 1 then
@@ -196,7 +220,7 @@ local _gain_script = [[
   if not ms then
    return {false, 'mail thief'}
   end
-  if not redis.call('exists', mail_id) then
+  if redis.call('exists', mail_id) == 0 then
   	return {false, 'mail miss'}
   end
   local f = tonumber(redis.call('hget', mail_id, 'gain_flag') or 0)
@@ -280,13 +304,19 @@ function mail.send(args)
 	if not red then
 		return 202, 'fail to create player mail| ' .. player_id .. '|' .. args
 	end
+  local player_key = _get_player_key(player_id)
+	if red:exists(player_key) == 0 then
+		return 203, 'player expired?'
+	end
   local now = ngx.time()
 	local mail_id = _generate_mail(red, 'mail:', player_id, now, mail_data, _mail_expire_secs + _mail_expire_ultra_seconds)
 	-- Normal mails
-  local player_key = _get_player_key(player_id)
 	red:zadd(player_key, now, mail_id)
 	if server_id then
 		red:zadd('mail_pending:'..server_id, player_id, mail_id) -- Used to notify player
+		-- notify game server
+		-- channel:game:server_id
+		red:publish('channel:game:' .. server_id, 'send_mail')
 	end
 	ngx.log(ngx.INFO, 'send mail to player single|', player_id, ' ', server_id, ' ', mail_id, ' ', args)
 
@@ -318,5 +348,7 @@ function mail.send_broadcast(args)
 	return 0, {mail_id=mail_id,server_id=server_id}
 end
 
+function mail.update()
+end
 
 return mail
