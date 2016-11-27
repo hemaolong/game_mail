@@ -10,6 +10,7 @@ local mail = {}
 local _mail_count_max = 60
 local _mail_expire_secs = 86400*30
 local _mail_expire_ultra_seconds = 86400*5
+local _get_pending_mail_max = 50
 
 local function _get_mail_redis()
 	local red = redis:new()
@@ -70,6 +71,10 @@ local function _fill_player_server_broadcast_mails(red, server_id, player_id, no
 	return true
 end
 
+local function _get_pending_pids_key(server_id)
+  return 'mail_pending:' .. server_id
+end
+
 function mail.init_server(args)
   local data = cjson.decode(args)
 	local server_id = data.server_id
@@ -77,7 +82,7 @@ function mail.init_server(args)
 		return {222, 'invalid server_id'}
 	end
 
-	local pending_key = 'mail_pending:' .. server_id
+	local pending_key = _get_pending_pids_key(server_id)
 	local red = _get_mail_redis()
 	red:del(pending_key)
 	ngx.log(ngx.INFO, 'game server init ', server_id)
@@ -95,11 +100,11 @@ local function _array2map(a)
 	return m
 end
 
-local function _resp_mail_list(red, player_id, mail_ids)
+local function _resp_mail_list(red, player_id, mail_ids, result_out)
 	if not mail_ids then
 		return
 	end
-	local result = {}
+	local result = result_out or {}
 	for k, v in ipairs(mail_ids) do
 		local mail_attay = red:hgetall(v)
 		if mail_attay and #mail_attay > 0 then
@@ -109,8 +114,30 @@ local function _resp_mail_list(red, player_id, mail_ids)
 			result[#result+1] = mail
 		end
 	end
+	return result
+end
+local function _resp_mail_multi_player_list(red, mail_ids)
+	if not mail_ids then
+		return
+	end
+	local result = {}
+	for i = 1, #mail_ids/2 do
+		local mail_id, player_id = mail_ids[2*i-1], mail_ids[2*i]
+		local mail_attay = red:hgetall(mail_id)
+		if mail_attay and #mail_attay > 0 then
+			local mail = _array2map(mail_attay)
+			mail['mail_id'] = mail_id
+			mail['player_id'] = player_id
+			result[#result+1] = mail
+		end
+	end
 	return 0, {mails=result}
 end
+
+local function _remove_player_from_pending(red, server_id, player_id)
+	red:srem(_get_pending_pids_key(server_id), player_id)
+end
+
 local function _get_player_mails(red, now, player_id, server_id)
 	if not player_id or player_id <= 0 then return 300, 'invalid player_id' end
 	local player_key = _get_player_key(player_id)
@@ -129,40 +156,54 @@ local function _get_player_mails(red, now, player_id, server_id)
 	if not ret then
 		ngx.log(ngx.ERR, 'get player mail error ', err)
 	end
-	red:zremrangebyscore('mail_pending:'..server_id, player_id, player_id)
-	return _resp_mail_list(red, player_id, ret)
+	_remove_player_from_pending(red, server_id, player_id)
+	local mails = _resp_mail_list(red, player_id, ret)
+	return {0, mails=mails}
 end
 
-local function _get_pending_mails(red, now, server_id)
+local function _get_pending_mails(red, now, pids_list, server_id)
   if not server_id then return 301, 'invalid server id' end
 
-  -- Only get the new mails
-	local peindingg_mails = red:zrange('mail_pending:'..server_id, 0, 99, 'withscores')
-	local mails = {}
-	for i = 1, #peindingg_mails/2 do
-		local mail_id = peindingg_mails[2*i-1]
-		local player_id = peindingg_mails[2*i]
+  local version = tonumber(red:hget('mail_version', player_id)) or now
+	_fill_player_server_broadcast_mails(red, server_id, player_id, now)
+
+  
+	local result = {}
+    for _, v in ipairs(pids_list) do
+		local player_key = _get_player_key(v)
+		local ret, err = red:zrevrangebyscore(player_key, now, version, 'limit', 0, _mail_count_max-1)
+		if not ret then
+			ngx.log(ngx.ERR, 'get player mail error ', err)
+			return
+		end
+		local mails = _resp_mail_list(red, v, ret, result)
+
 	end
 
-	red:zremrangebyscore('mail_pending:'..server_id, player_id, player_id)
-	return _resp_mail_list(red, player_id, peindingg_mails)
+	return {0, mails=result}
 end
 
 function mail.get(args)
   local data = cjson.decode(args)
-	local player_id, server_id, get_all = data.player_id, data.server_id, data.get_all
+	local get_all, server_id = data.get_all, data.server_id
 	local now = ngx.time()
 	local red = _get_mail_redis()
+	-- Get one player's all mail
 	if get_all then
+		local player_id = data.player_id
 		return _get_player_mails(red, now, player_id, server_id)
+	else
+		-- Get multi players's pending mails
+		local player_id_list = data.player_id_list
+		return _get_pending_mails(red, now, player_id_list, server_id)
 	end
 end
 
-function mail.get_pendings(args)
-  local data = cjson.decode(args)
-	local server_id = data.player_id, data.server_id, data.get_all
+-- function mail.get_pendings(args)
+--   local data = cjson.decode(args)
+-- 	local server_id = data.player_id, data.server_id, data.get_all
 
-end
+-- end
 
 function mail.delete(args)
 	local data = cjson.decode(args)
@@ -288,6 +329,18 @@ local function _generate_mail(red, prefix, player_id, now, mail_data, expire_sec
 	return mail_id, mail_params
 end
 
+local _shared_mail_pool = ngx.shared.shared_mail_poll
+local function _set_pending_dirty(server_id, dirty)
+  	if dirty then
+    	_shared_mail_pool:set(server_id, true)
+	else
+		_shared_mail_pool:delete(server_id)
+	end
+end
+local function _get_pending_dirty(server_id, dirty)
+  return _shared_mail_pool:get(server_id)
+end
+
 -- Normal mails
 function mail.send(args)
   local mail_data = cjson.decode(args)
@@ -313,7 +366,7 @@ function mail.send(args)
 	-- Normal mails
 	red:zadd(player_key, now, mail_id)
 	if server_id then
-		red:zadd('mail_pending:'..server_id, player_id, mail_id) -- Used to notify player
+		red:sadd(_get_pending_pids_key(server_id), player_id) -- Used to notify player
 		-- notify game server
 		-- channel:game:server_id
 		red:publish('channel:game:' .. server_id, 'send_mail')
@@ -348,7 +401,20 @@ function mail.send_broadcast(args)
 	return 0, {mail_id=mail_id,server_id=server_id}
 end
 
-function mail.update()
+function mail.poll(server_id)
+	if not _get_pending_dirty(server_id) then
+		return
+	end
+
+	local red = _get_mail_redis()
+  local pending_key = _get_pending_pids_key(server_id)
+	local pending_pids = red:srandmembers(pending_key, 0, _get_pending_mail_max-1)	
+  if #pending_pids == 0 then
+	  return
+	end
+  -- Only get the new mails
+	red:srem(pending_key, pending_pids)
+	return pending_pids
 end
 
 return mail

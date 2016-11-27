@@ -5,7 +5,9 @@
 
 local cjson = require 'cjson'
 local conf = require 'conf_server'
-local redis = require "resty.redis"
+local redis = require 'resty.redis'
+local mail = require 'mail'
+local gm = require 'gm'
 local game = {}
 
 function game.poll(args)
@@ -27,7 +29,19 @@ function game.poll(args)
 		return 52, 'redis lost'
 	end
 
+  -- First, check mails
   local chan = "channel:game:"..data.server_id
+  local mail_data = mail.poll(data.server_id)
+  if mail_data then
+  	return 0, {chan, 'mail', mail_data}
+  end
+
+  -- Second, check gm commands
+  local gm_cmds = gm.poll(data.server_id)
+  if gm_cmds then
+  	return 0, {chan, 'gm', gm_cmds}
+  end
+
 	local sub_rep, sub_err = red:subscribe(chan)
   if not sub_rep then
     return 53, 'failed to subscribe: ' .. sub_err
@@ -39,7 +53,7 @@ function game.poll(args)
 		 ngx.exit(500)
 		end)
   while true do
-	  local read_data, read_err = red:read_reply()
+	local read_data, read_err = red:read_reply()
   	if not read_data then
   		if read_err ~= 'timeout' then
   			break
@@ -47,7 +61,7 @@ function game.poll(args)
   	else
 			redis:unsubscribe(chan)
 		  --ngx.log(ngx.DEBUG, 'poll ', data.server_id)
-		  return 0, read_data
+		  return 0
   	end
 	end
 
