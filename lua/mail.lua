@@ -4,6 +4,8 @@
 local cjson = require 'cjson'
 local conf = require 'conf_server'
 local redis = require "resty.redis"
+local tonumber = tonumber
+local unpack = unpack
 
 local mail = {}
 
@@ -20,6 +22,7 @@ local function _get_mail_redis()
 	if not ok then
 		return
 	end
+	--red:set_keepalive(1000*300, 100)
 	return red
 end
 local function _get_player_key(player_id)
@@ -158,29 +161,28 @@ local function _get_player_mails(red, now, player_id, server_id)
 	end
 	_remove_player_from_pending(red, server_id, player_id)
 	local mails = _resp_mail_list(red, player_id, ret)
-	return {0, mails=mails}
+	return 0, {mails=mails}
 end
 
 local function _get_pending_mails(red, now, pids_list, server_id)
   if not server_id then return 301, 'invalid server id' end
 
-  local version = tonumber(red:hget('mail_version', player_id)) or now
-	_fill_player_server_broadcast_mails(red, server_id, player_id, now)
+  ngx.log(ngx.INFO, '_get_pending_mails ', cjson.encode(pids_list))
 
-  
 	local result = {}
     for _, v in ipairs(pids_list) do
-		local player_key = _get_player_key(v)
-		local ret, err = red:zrevrangebyscore(player_key, now, version, 'limit', 0, _mail_count_max-1)
-		if not ret then
-			ngx.log(ngx.ERR, 'get player mail error ', err)
-			return
+			_fill_player_server_broadcast_mails(red, server_id, v, now)
+      local version = tonumber(red:hget('mail_version', v)) or now
+			local player_key = _get_player_key(v)
+			local ret, err = red:zrevrangebyscore(player_key, now, version, 'limit', 0, _mail_count_max-1)
+			if not ret then
+				ngx.log(ngx.ERR, 'get player mail error ', err)
+				return
+			end
+			local mails = _resp_mail_list(red, v, ret, result)
 		end
-		local mails = _resp_mail_list(red, v, ret, result)
 
-	end
-
-	return {0, mails=result}
+	return 0, {mails=result}
 end
 
 function mail.get(args)
@@ -370,6 +372,7 @@ function mail.send(args)
 		-- notify game server
 		-- channel:game:server_id
 		red:publish('channel:game:' .. server_id, 'send_mail')
+		_set_pending_dirty(server_id, true)
 	end
 	ngx.log(ngx.INFO, 'send mail to player single|', player_id, ' ', server_id, ' ', mail_id, ' ', args)
 
@@ -408,12 +411,13 @@ function mail.poll(server_id)
 
 	local red = _get_mail_redis()
   local pending_key = _get_pending_pids_key(server_id)
-	local pending_pids = red:srandmembers(pending_key, 0, _get_pending_mail_max-1)	
+	local pending_pids = red:srandmember(pending_key, _get_pending_mail_max-1)	
   if #pending_pids == 0 then
+    _set_pending_dirty(server_id, false)
 	  return
 	end
   -- Only get the new mails
-	red:srem(pending_key, pending_pids)
+	red:srem(pending_key, unpack(pending_pids))
 	return pending_pids
 end
 

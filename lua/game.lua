@@ -53,7 +53,7 @@ function game.poll(args)
 		 ngx.exit(500)
 		end)
   while true do
-	local read_data, read_err = red:read_reply()
+		local read_data, read_err = red:read_reply()
   	if not read_data then
   		if read_err ~= 'timeout' then
   			break
